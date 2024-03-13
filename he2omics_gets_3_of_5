@@ -1,0 +1,2202 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os, sys\n",
+    "sys.path.append( '..' )"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import argparse\n",
+    "import pickle as pkl\n",
+    "import pandas as pd\n",
+    "import numpy as np\n",
+    "from collections import Counter\n",
+    "#from wsi_data import subset_wsi_dataset\n",
+    "\n",
+    "import torch\n",
+    "from torch import nn, optim\n",
+    "import torch.multiprocessing as mp\n",
+    "from torch.utils.data import Subset\n",
+    "\n",
+    "import copy as cp\n",
+    "import yaml\n",
+    "from sklearn.model_selection import KFold, StratifiedKFold\n",
+    "\n",
+    "import matplotlib.pyplot as plt"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from model import HE2Omics, fit, predict\n",
+    "from experiment import Experiment\n",
+    "from copy import deepcopy"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from wsi_data import patient_stratified_kfold\n",
+    "#from image_materials.model import ImageToSubtype\n",
+    "\n",
+    "#from image_materials.experiment import ImageSetup\n",
+    "#from image_materials.train import *"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "rootdir = '/gstore/data/tmai/Yasin/TMONC/HE2OMICS/TRL/2024_1_8'\n",
+    "savedir = './FOLDS/'\n",
+    "logdir = './exp'"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def subset_wsi_dataset(dataset, subset_ix):\n",
+    "    \"\"\" Subset WSI dataset class instance with indices from subset_ix\n",
+    "    \"\"\"\n",
+    "    dataset_copy = deepcopy(dataset)\n",
+    "    dataset_copy.samples = [dataset.samples[ix] for ix in subset_ix]\n",
+    "    dataset_copy.patients = np.array([dataset.patients[ix] for ix in subset_ix])\n",
+    "    dataset_copy.trials = pd.Series([dataset.trials[ix] for ix in subset_ix])\n",
+    "    dataset_copy.subtypes = pd.Series([dataset.subtypes[ix] for ix in subset_ix])\n",
+    "    return(dataset_copy)  "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def convert_to_subtype_prediction(dataset,class_names,scaleFeatures=True,n_tiles=False):\n",
+    "    \"\"\"\n",
+    "    Change (image,expression) tuples to (image,subtype), and make AlltilesWSI dataset\n",
+    "    \"\"\"\n",
+    "    # string names for subtypes\n",
+    "    subtype = [str(i) for i in list(group2_dataset.subtypes)]\n",
+    "    # convert to indices\n",
+    "    subtype = [class_names.index(name) for name in subtype]\n",
+    "    \n",
+    "    dataset_copy = deepcopy(dataset)\n",
+    "    new_samples = [(image,int(subtype[idx])) for idx,(image,_) in enumerate(dataset_copy.samples)]\n",
+    "    #dataset_copy.samples = new_samples\n",
+    "    subtype_dataset = AlltilesWSI(new_samples,scaleFeatures=scaleFeatures,n_tiles=n_tiles)\n",
+    "    return(subtype_dataset)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "tags": []
+   },
+   "source": [
+    "### Define config files, use 50 most discriminant genes in HE2Omics"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Using configuration defined in /gstore/data/tmai/Yasin/TMONC/HE2OMICS/TRL/2024_1_8/configs/IMvigor_3trial_50genes.ini\n"
+     ]
+    }
+   ],
+   "source": [
+    "confi = yaml.load(open(os.path.join(rootdir,\"config_main_50genes.yaml\"), \"r\"), Loader=yaml.FullLoader)\n",
+    "print('Using configuration defined in {}'.format(confi['config']))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Build dataset and permute patients stratifying on trial and subtype"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "logTransform: False, scaleVariables: False, ensureNonnegativity: True\n",
+      "Number of variables in input: 51\n",
+      "Number of genes found in transcriptome data: 51\n",
+      "Filtered out 161 slides less than 1000 tiles\n",
+      "number of images with paired omic data: 2285\n",
+      "Number of patients: 1810\n"
+     ]
+    }
+   ],
+   "source": [
+    "config = confi['config']\n",
+    "exp = Experiment(config)\n",
+    "\n",
+    "# Read architecture and training parameters\n",
+    "model_params = exp._read_architecture()\n",
+    "training_params = exp._read_training_params()\n",
+    "\n",
+    "# Build dataset\n",
+    "dataset = exp._build_dataset()\n",
+    "# UNIQUE PATIENT IDENTIFIERS\n",
+    "pat_ids_unique, uniq_indices = np.unique(dataset.patients,return_index=True)\n",
+    "TOT_pat = pat_ids_unique.shape[0]\n",
+    "print(f'Number of patients: {TOT_pat}')\n",
+    "\n",
+    "# STRATIFY BY TRIAL AND SUBTYPE\n",
+    "class_list = []\n",
+    "for trial,subtype in zip(dataset.trials,dataset.subtypes):\n",
+    "    class_list.append(trial+'_NMF'+str(subtype))\n",
+    "class_list = np.array(class_list)\n",
+    "class_list_patients = class_list[uniq_indices]\n",
+    "\n",
+    "# PARAMETERS\n",
+    "Nsplit = 10\n",
+    "kfold_group1 = 5\n",
+    "\n",
+    "# PERMUTE PATIENTS\n",
+    "ind_testing = np.zeros((Nsplit, TOT_pat))\n",
+    "np.random.seed(42)\n",
+    "for i in range(Nsplit):\n",
+    "    ind_testing[i, :] = np.random.permutation(TOT_pat)\n",
+    "ind_testing = ind_testing.astype(int)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Number of group 1 patients: 905, Number of group 2 patients: 905\n",
+      "Number of group 1 images: 1159, Number of group 2 images: 1126\n",
+      "Running split 2, fold 1\n",
+      "Features starting with: GENE\n",
+      "about to train model\n",
+      "Mean spearman r: 0.026\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:11<00:00,  2.46s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 1/300 - 119.76s\n",
+      "loss: 0.9922, val loss: 1.0465\n",
+      "Mean spearman r: 0.238\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:11<00:00,  2.46s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 2/300 - 95.11s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.8949, val loss: 0.9067\n",
+      "Mean spearman r: 0.344\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:07<00:00,  2.34s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 3/300 - 89.52s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.8421, val loss: 0.8383\n",
+      "Mean spearman r: 0.416\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:08<00:00,  2.35s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 4/300 - 90.38s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.7899, val loss: 0.8047\n",
+      "Mean spearman r: 0.461\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:08<00:00,  2.36s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 5/300 - 90.70s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.7573, val loss: 0.7698\n",
+      "Mean spearman r: 0.490\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:08<00:00,  2.35s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 6/300 - 91.03s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.7352, val loss: 0.7674\n",
+      "Mean spearman r: 0.500\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:18<00:00,  2.70s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 7/300 - 103.19s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.7027, val loss: 0.7357\n",
+      "Mean spearman r: 0.523\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.79s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 8/300 - 105.87s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.6905, val loss: 0.7199\n",
+      "Mean spearman r: 0.540\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:18<00:00,  2.71s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 9/300 - 104.39s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.6844, val loss: 0.7567\n",
+      "Mean spearman r: 0.536\n",
+      "Num epochs since best: 2\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:19<00:00,  2.74s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 10/300 - 106.74s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.6870, val loss: 0.7542\n",
+      "Mean spearman r: 0.542\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:19<00:00,  2.74s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 11/300 - 106.42s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.6615, val loss: 0.7095\n",
+      "Mean spearman r: 0.550\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.78s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 12/300 - 106.09s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.6512, val loss: 0.7051\n",
+      "Mean spearman r: 0.559\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.78s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 13/300 - 106.79s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.6455, val loss: 0.7097\n",
+      "Mean spearman r: 0.555\n",
+      "Num epochs since best: 2\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.76s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 14/300 - 107.21s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.6370, val loss: 0.7036\n",
+      "Mean spearman r: 0.562\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [02:10<00:00,  4.48s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 15/300 - 169.34s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.6250, val loss: 0.6923\n",
+      "Mean spearman r: 0.565\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:21<00:00,  2.80s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 16/300 - 106.95s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.6175, val loss: 0.7084\n",
+      "Mean spearman r: 0.561\n",
+      "Num epochs since best: 2\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [02:15<00:00,  4.67s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 17/300 - 161.76s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.6091, val loss: 0.7076\n",
+      "Mean spearman r: 0.559\n",
+      "Num epochs since best: 3\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:37<00:00,  3.35s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 18/300 - 150.83s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.6048, val loss: 0.6961\n",
+      "Mean spearman r: 0.563\n",
+      "Num epochs since best: 4\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:19<00:00,  2.75s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 19/300 - 106.81s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.6015, val loss: 0.7071\n",
+      "Mean spearman r: 0.562\n",
+      "Num epochs since best: 5\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:17<00:00,  2.67s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 20/300 - 103.68s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5972, val loss: 0.6908\n",
+      "Mean spearman r: 0.567\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:22<00:00,  2.85s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 21/300 - 108.67s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5851, val loss: 0.6823\n",
+      "Mean spearman r: 0.571\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:15<00:00,  2.61s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 22/300 - 101.73s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5759, val loss: 0.6804\n",
+      "Mean spearman r: 0.573\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:18<00:00,  2.72s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 23/300 - 105.58s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5663, val loss: 0.6882\n",
+      "Mean spearman r: 0.573\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:19<00:00,  2.75s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 24/300 - 106.17s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5767, val loss: 0.6847\n",
+      "Mean spearman r: 0.575\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.76s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 25/300 - 106.59s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5582, val loss: 0.6750\n",
+      "Mean spearman r: 0.574\n",
+      "Num epochs since best: 2\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:19<00:00,  2.73s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 26/300 - 104.06s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5602, val loss: 0.6813\n",
+      "Mean spearman r: 0.571\n",
+      "Num epochs since best: 3\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:19<00:00,  2.75s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 27/300 - 105.27s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5517, val loss: 0.7070\n",
+      "Mean spearman r: 0.568\n",
+      "Num epochs since best: 4\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.78s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 28/300 - 108.11s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5443, val loss: 0.6813\n",
+      "Mean spearman r: 0.571\n",
+      "Num epochs since best: 5\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:22<00:00,  2.83s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 29/300 - 109.26s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5408, val loss: 0.6802\n",
+      "Mean spearman r: 0.576\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:21<00:00,  2.80s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 30/300 - 107.70s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5359, val loss: 0.7030\n",
+      "Mean spearman r: 0.578\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.77s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 31/300 - 106.40s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5379, val loss: 0.6720\n",
+      "Mean spearman r: 0.575\n",
+      "Num epochs since best: 2\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.77s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 32/300 - 107.67s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5321, val loss: 0.6882\n",
+      "Mean spearman r: 0.575\n",
+      "Num epochs since best: 3\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:19<00:00,  2.75s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 33/300 - 107.62s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5318, val loss: 0.6892\n",
+      "Mean spearman r: 0.581\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:21<00:00,  2.82s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 34/300 - 109.53s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5192, val loss: 0.6783\n",
+      "Mean spearman r: 0.577\n",
+      "Num epochs since best: 2\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:17<00:00,  2.68s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 35/300 - 103.30s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5134, val loss: 0.6700\n",
+      "Mean spearman r: 0.578\n",
+      "Num epochs since best: 3\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:21<00:00,  2.82s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 36/300 - 109.06s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5083, val loss: 0.6791\n",
+      "Mean spearman r: 0.580\n",
+      "Num epochs since best: 4\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.79s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 37/300 - 106.30s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5055, val loss: 0.6765\n",
+      "Mean spearman r: 0.577\n",
+      "Num epochs since best: 5\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:18<00:00,  2.71s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 38/300 - 105.66s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4983, val loss: 0.6798\n",
+      "Mean spearman r: 0.576\n",
+      "Num epochs since best: 6\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:21<00:00,  2.80s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 39/300 - 110.19s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5036, val loss: 0.6713\n",
+      "Mean spearman r: 0.579\n",
+      "Num epochs since best: 7\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:22<00:00,  2.84s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 40/300 - 109.60s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4998, val loss: 0.6691\n",
+      "Mean spearman r: 0.579\n",
+      "Num epochs since best: 8\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.79s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 41/300 - 107.67s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4865, val loss: 0.6820\n",
+      "Mean spearman r: 0.578\n",
+      "Num epochs since best: 9\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:21<00:00,  2.83s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 42/300 - 109.79s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4886, val loss: 0.6835\n",
+      "Mean spearman r: 0.575\n",
+      "Num epochs since best: 10\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.79s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 43/300 - 105.64s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4865, val loss: 0.6804\n",
+      "Mean spearman r: 0.571\n",
+      "Num epochs since best: 11\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.78s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 44/300 - 107.69s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.5022, val loss: 0.6655\n",
+      "Mean spearman r: 0.583\n",
+      "Num epochs since best: 1\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:18<00:00,  2.69s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 45/300 - 107.59s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4822, val loss: 0.6767\n",
+      "Mean spearman r: 0.578\n",
+      "Num epochs since best: 2\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.76s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 46/300 - 108.36s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4816, val loss: 0.6769\n",
+      "Mean spearman r: 0.574\n",
+      "Num epochs since best: 3\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:22<00:00,  2.84s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 47/300 - 108.96s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4743, val loss: 0.6664\n",
+      "Mean spearman r: 0.582\n",
+      "Num epochs since best: 4\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:21<00:00,  2.82s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 48/300 - 108.75s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4710, val loss: 0.6648\n",
+      "Mean spearman r: 0.581\n",
+      "Num epochs since best: 5\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:21<00:00,  2.80s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 49/300 - 108.53s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4679, val loss: 0.6714\n",
+      "Mean spearman r: 0.576\n",
+      "Num epochs since best: 6\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:22<00:00,  2.85s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 50/300 - 109.93s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4707, val loss: 0.6697\n",
+      "Mean spearman r: 0.580\n",
+      "Num epochs since best: 7\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:15<00:00,  2.60s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 51/300 - 104.25s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4630, val loss: 0.6800\n",
+      "Mean spearman r: 0.579\n",
+      "Num epochs since best: 8\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:13<00:00,  2.53s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 52/300 - 97.88s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4619, val loss: 0.6791\n",
+      "Mean spearman r: 0.577\n",
+      "Num epochs since best: 9\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.76s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 53/300 - 104.01s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4586, val loss: 0.6680\n",
+      "Mean spearman r: 0.580\n",
+      "Num epochs since best: 10\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 29/29 [01:20<00:00,  2.77s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 54/300 - 107.52s\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "  0%|          | 0/29 [00:00<?, ?it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "loss: 0.4554, val loss: 0.6664\n",
+      "Mean spearman r: 0.579\n",
+      "Num epochs since best: 11\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      " 86%|████████▌ | 25/29 [01:15<00:11,  2.99s/it]"
+     ]
+    }
+   ],
+   "source": [
+    "# SEPARATE GROUP1 AND GROUP2 PATIENTS\n",
+    "# Group 1 gets the patients for transcriptomic learning\n",
+    "# Group 2 is the patient set where the image-based model will be compared with transfer learning (the transcriptomic model from group 1)\n",
+    "\n",
+    "start_split = 2\n",
+    "start_fold = 1\n",
+    "\n",
+    "# loop from 0 to Nsplit\n",
+    "for rs in range(start_split,Nsplit):\n",
+    "    ind = ind_testing[rs, :]\n",
+    "    shuffled_patient_classes = class_list_patients[ind]\n",
+    "    shuffled_patients = pat_ids_unique[ind]\n",
+    "\n",
+    "    skf = StratifiedKFold(n_splits=2, shuffle=False) # shuffling is done earlier with permutations\n",
+    "\n",
+    "    # Transcriptomic learning gets n_splits-1 folds (index1), classifier training gets 1 fold (index 2)\n",
+    "    # index1, index2 = next(iter(skf.split(ind, shuffled_patient_classes)))\n",
+    "    group1_index, group2_index = next(iter(skf.split(ind, shuffled_patient_classes)))\n",
+    "\n",
+    "    print(f'Number of group 1 patients: {len(group1_index)}, Number of group 2 patients: {len(group2_index)}')\n",
+    "\n",
+    "    pat_G1 = shuffled_patients[group1_index]\n",
+    "    pat_G2 = shuffled_patients[group2_index]\n",
+    "    pat_G1_classes = shuffled_patient_classes[group1_index]\n",
+    "    pat_G2_classes = shuffled_patient_classes[group2_index]\n",
+    "    \n",
+    "    # Make group 1 and group 2 datasets\n",
+    "    slide_ix_group1 = [ix for ix, d in enumerate(dataset.patients) if d in pat_G1]\n",
+    "    slide_ix_group2 = [ix for ix, d in enumerate(dataset.patients) if d in pat_G2]\n",
+    "    group1_dataset = subset_wsi_dataset(dataset,slide_ix_group1)\n",
+    "    group2_dataset = subset_wsi_dataset(dataset,slide_ix_group2)\n",
+    "    \n",
+    "    print(f'Number of group 1 images: {len(group1_dataset)}, Number of group 2 images: {len(group2_dataset)}')\n",
+    "    \n",
+    "    # Stratified KFold to train the gene prediction model within group 1 slides\n",
+    "    # Cross-validation will be done over slides (not patients) because inference will be on group 2 slides\n",
+    "    skf = StratifiedKFold(n_splits=kfold_group1, shuffle=True, random_state=1)\n",
+    "\n",
+    "    # Stratify by TRIAL and SUBTYPE\n",
+    "    g1_class_list = []\n",
+    "    for trial,subtype in zip(group1_dataset.trials,group1_dataset.subtypes):\n",
+    "        g1_class_list.append(trial+'_NMF'+str(subtype))\n",
+    "    g1_class_list = np.array(g1_class_list)\n",
+    "    \n",
+    "    # Creating a folder for each split\n",
+    "    model_savedir = os.path.join(exp.savedir,'split'+str(rs))\n",
+    "    os.makedirs(model_savedir, exist_ok=True)\n",
+    "        \n",
+    "    # Run cross-validation\n",
+    "    for fold, (train_index, valid_index) in enumerate(skf.split(np.zeros((len(group1_dataset), 1)), g1_class_list)):\n",
+    "\n",
+    "        if rs==start_split and fold < start_fold:\n",
+    "            continue\n",
+    "        print(f'Running split {str(rs)}, fold {str(fold)}')\n",
+    "\n",
+    "        # If pickle file for samples does not exist, define and save it\n",
+    "        os.makedirs(savedir, exist_ok=True)\n",
+    "        path_pickle_file = os.path.join(savedir,'train_and_valid_set_ids_fold'+ str(fold) + '.pkl')\n",
+    "        if not os.path.exists(path_pickle_file):\n",
+    "            train_he = []\n",
+    "            for idx in train_index:\n",
+    "                filename = os.path.basename(group1_dataset.samples[idx][0]).replace('.npy','')\n",
+    "                train_he.append(filename)\n",
+    "\n",
+    "            valid_he = []\n",
+    "            for idx in valid_index:\n",
+    "                filename = os.path.basename(group1_dataset.samples[idx][0]).replace('.npy','')\n",
+    "                valid_he.append(filename)\n",
+    "\n",
+    "            # save train and validation slide identifers\n",
+    "            he_tuple = (train_he,valid_he)\n",
+    "            with open(path_pickle_file, 'wb') as handle:\n",
+    "                pkl.dump(he_tuple, handle)\n",
+    "\n",
+    "        # subset train and validation sets\n",
+    "        train_set = Subset(group1_dataset, train_index)\n",
+    "        valid_set = Subset(group1_dataset, valid_index)\n",
+    "        valid_ctype_integers = np.zeros((len(valid_index))) # all zeroes since all samples are from the same cancer type\n",
+    "        model_params['input_dim'] = group1_dataset.dim # 2048\n",
+    "        model_params['output_dim'] = len(dataset.variables)\n",
+    "        print('Features starting with: {}'.format(dataset.variables[0][:4]))\n",
+    "\n",
+    "        # Initialize bias of the last layer with the average target value on the train set\n",
+    "        try:\n",
+    "            model_params['bias_init'] = torch.nn.Parameter(torch.Tensor(np.mean([sample[1] for sample in train_set], axis=0)).cuda())\n",
+    "        except ValueError:\n",
+    "            model_params['bias_init'] = torch.nn.Parameter(torch.Tensor(np.mean([sample[1].numpy() for sample in train_set], axis=0)).cuda())\n",
+    "\n",
+    "        model = HE2Omics(**model_params)\n",
+    "        optimizer = exp._setup_optimization(model)\n",
+    "        scheduler = optim.lr_scheduler.StepLR(optimizer,step_size=5,gamma=0.9)\n",
+    "        \n",
+    "        print(\"about to train model\")\n",
+    "        test_preds, test_labels, valid_preds, valid_labels = fit(model,\n",
+    "                            train_set,\n",
+    "                            valid_set,\n",
+    "                            valid_ctype_integers,\n",
+    "                            params=training_params,\n",
+    "                            optimizer=optimizer,\n",
+    "                            scheduler=scheduler,\n",
+    "                            logdir=logdir,\n",
+    "                            path=model_savedir,\n",
+    "                            fold=fold)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "condabase",
+   "language": "python",
+   "name": "condabase"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.8.8"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
